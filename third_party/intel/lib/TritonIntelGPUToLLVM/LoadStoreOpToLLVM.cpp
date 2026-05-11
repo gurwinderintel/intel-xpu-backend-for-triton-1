@@ -2494,11 +2494,16 @@ private:
             rewriter,
             mlir::LLVM::LLVMPointerType::get(
                 ctx, TritonGEN::TritonGENMemorySpace::kCrossWorkgroup));
-    Value warpId = arith::IndexCastOp::create(
-        rewriter, loc, i32_ty,
-        mlir::gpu::SubgroupIdOp::create(rewriter, loc,
-                                        /*upperBound=*/nullptr));
-    for (size_t row = 0; row < prefetchRowsNumPerWarp; row++) {
+    // Value warpId = arith::IndexCastOp::create(
+    //     rewriter, loc, i32_ty,
+    //     mlir::gpu::SubgroupIdOp::create(rewriter, loc,
+    //                                     /*upperBound=*/nullptr));
+
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+    // Value pidX = targetInfo.programId(
+    //     rewriter, loc, op->getParentOfType<ModuleOp>(), ProgramIDDim::X);
+
+    for (size_t row = 0; row < prefetchColsNumPerWarp; row++) {
       Value addrElem = targetInfo.shuffleIdx(rewriter, loc, baseAddress, 0);
       // update offset X.
       auto offsets =
@@ -2538,6 +2543,11 @@ private:
                b.i32_val(static_cast<int>(tritonToIntelCacheModifier(op)))});
           return SmallVector<Value>{};
         };
+
+        // targetInfo.printf(rewriter,
+        //                   "johnlu prefetch: pid: %d, warp id: %d, lane id: %d
+        //                   " "addr %p offsetX %d ", {pidX, warpId, laneId,
+        //                   addrElem, offsetX});
 
         Block &endBlock = LLVM::intel::createPredicatedBlock(
             rewriter, loc, pred, createLoadWithAttrs);
@@ -2637,10 +2647,9 @@ struct LoadOpToBlockIOConversion
             const_cast<triton::intel::ModuleAxisInfoAnalysis &>(
                 axisAnalysisPass)
                 .getAxisInfo(op.getPtr());
-        sizeInfo = get2DBlockLoadTileSize(
-            llEncoding.value(), contiguousDim, elemSizeInBits, ptrAxisInfo,
-            maskAxisInfo,
-            oneMatrixPerLoadForBT);
+        sizeInfo = get2DBlockLoadTileSize(llEncoding.value(), contiguousDim,
+                                          elemSizeInBits, ptrAxisInfo,
+                                          maskAxisInfo, oneMatrixPerLoadForBT);
       } else {
         sizeInfo = get1DBlockIOTileSize(llEncoding.value(), contiguousDim,
                                         elemSizeInBits);
@@ -2899,7 +2908,16 @@ struct LoadOpToBlockIOConversion
             /*transpose*/ isTransposeRequired,
             /*vnni_transform*/ !isTransposeRequired && useVNNIFormat);
       }
-
+      // targetInfo.printf(
+      //     rewriter,
+      //     "johnlu load: warp id: %d, lane id: %d addr %p baseWidth %d "
+      //     "baseHeight %d pitch %d offsetX %d offsetY %d packedElemSizeInBits
+      //     "
+      //     "%d tileWidth %d tileHeight %d vBlocks %d ret %f",
+      //     {warpId, laneId, addrElem, baseWidth, baseHeight, pitch, offsetX,
+      //      offsetY, b.i32_val(packedElemSizeInBits), b.i32_val(tileWidth),
+      //      b.i32_val(tileHeight), b.i32_val(vBlocks),
+      //      b.bitcast(ret, unpackedType)});
       {
         // When strides[0] is 0, we only want to load the first row, so we
         // set the base height to be 1. If tile height is bigger than 1,
@@ -3642,10 +3660,14 @@ struct DescriptorGatherOpConversion
       padding = paddingAttr.getValue();
 
     SmallVector<Value> loadedVals(numElems);
-    Value warpId = arith::IndexCastOp::create(
-        rewriter, loc, i32_ty,
-        mlir::gpu::SubgroupIdOp::create(rewriter, loc,
-                                        /*upperBound=*/nullptr));
+    // Value warpId = arith::IndexCastOp::create(
+    //     rewriter, loc, i32_ty,
+    //     mlir::gpu::SubgroupIdOp::create(rewriter, loc,
+    //     /*upperBound=*/nullptr));
+    auto pid = targetInfo.programId(
+        rewriter, loc, op->getParentOfType<ModuleOp>(), ProgramIDDim::X);
+
+    auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
     for (size_t elemIdx = 0; elemIdx < numElems; elemIdx += numElemsPerLoad) {
       unsigned registerIdx = regMapping.apply({{kRegister, elemIdx}})[0].second;
 
@@ -3663,7 +3685,76 @@ struct DescriptorGatherOpConversion
               b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offsetPair.second);
         }
       }
+#if 0
+      // Make a nonuniform pointer of vector.
+      {
+        constexpr StringLiteral nonUniformPtrDefine = R"({
+  .decl ADDR v_type=G type=uq num_elts=16 align=wordx32 alias=<$0, 0>
+  mov (M1_NM, 1) $ADDR(0, 0)<1> $1(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 1)<1> $2(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 2)<1> $3(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 3)<1> $4(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 4)<1> $5(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 5)<1> $6(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 6)<1> $7(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(0, 7)<1> $8(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 0)<1> $9(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 1)<1> $10(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 2)<1> $11(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 3)<1> $12(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 4)<1> $13(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 5)<1> $14(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 6)<1> $15(0, 0)<0;1,0>
+  mov (M1_NM, 1) $ADDR(1, 7)<1> $16(0, 0)<0;1,0>
+})";
+        XeBuilder xeBuilder;
+        XeInstr &packPtr =
+            *xeBuilder.create<XeInstr>(nonUniformPtrDefine.str());
+        XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
+        SmallVector<XeBuilder::Operand *> args{res};
+        for (size_t i = 0; i < tileHeight; ++i) {
+          unsigned offsetIdx =
+              regMapping.apply({{kRegister, elemIdx + i}})[0].second;
+          auto offsets = offMapping.apply(
+              {{kRegister, offsetIdx}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
 
+          for (auto [dim, offsetIdx] : offsets) {
+            // Update offset X
+            Value offsetX = b.zext(int_ty(64), offsetsX[offsetIdx]);
+            Value offset64 = b.mul(offsetX, desc.strides[rowDim]);
+            Value addr0 =
+                b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offset64);
+            Value addr1 = b.gep(ptr_ty(ctx, 1), valueElemTy, addr0,
+                                b.i32_val(bytesPerLane * 8 / elemSizeInBits));
+            // Update offset Y
+            args.push_back(xeBuilder.newOperand(b.ptrtoint(i64_ty, addr0), "rw"));
+            args.push_back(xeBuilder.newOperand(b.ptrtoint(i64_ty, addr1), "rw"));
+            break;
+          }
+        }
+
+        packPtr(args, /*onlyAttachMLIRArgs=*/true);
+
+        addrElem = xeBuilder.launch(rewriter, loc, i64_ty, false);
+      }
+
+      // Load with the nonuniform pointer
+      Value ret;
+      {
+        constexpr StringLiteral gatherLoad = R"({
+  .decl ADDR v_type=G type=uq num_elts=16 align=wordx32 alias=<$1, 0>
+  lsc_load.ugm (M1, 16)  $0:d32x4  flat[ADDR]:a64
+})";
+
+        XeBuilder xeBuilder;
+        XeInstr &loadGather = *xeBuilder.create<XeInstr>(gatherLoad.str());
+        XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
+        XeBuilder::Operand *addr = xeBuilder.newOperand(addrElem, "rw");
+        SmallVector<XeBuilder::Operand *> args{res, addr};
+        loadGather(args, /*onlyAttachMLIRArgs=*/true);
+        ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
+      }
+#else
       SmallVector<Value> addrs;
       for (size_t i = 0; i < tileHeight; ++i) {
         Value indexVal =
@@ -3720,7 +3811,11 @@ struct DescriptorGatherOpConversion
 
       loadGather(args, /*onlyAttachMLIRArgs=*/true);
       Value ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
-
+#endif
+      targetInfo.printf(
+          rewriter,
+          "johnlu load: pid: %d, warp id: %d, lane id: %d addr %p ret %f",
+          {pid, warpId, laneId, addrElem, b.bitcast(ret, unpackedType)});
       unpackBlockLoadResult(ret, loadedVals, elemIdx, regMapping,
                             shuffleMapping, {}, unpackedType, numValuesPerLoad,
                             numPackedVals, {}, {},
@@ -3774,9 +3869,6 @@ struct DescriptorGatherOpConversion
             mlir::LLVM::LLVMPointerType::get(
                 ctx, TritonGEN::TritonGENMemorySpace::kCrossWorkgroup));
 
-    // auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
-    // auto pid = targetInfo.programId(rewriter, loc,
-    // op->getParentOfType<ModuleOp>(), ProgramIDDim::X);
     SmallVector<Value> loadedVals(numElems);
     // unsigned ptrIdx = 0;
     // for(auto &p: ptrElems) {
@@ -3827,11 +3919,6 @@ struct DescriptorGatherOpConversion
       ret = *endBlock.args_begin();
       assert(ret && "Expecting a valid value");
 
-      // targetInfo.printf(
-      //     rewriter,
-      //     "johnlu load: pid: %d, warp id: %d, lane id: %d addr %p offsetX %d
-      //     ret %f", {pid, warpId, laneId, addrElem, offset_x, b.bitcast(ret,
-      //     unpackedType)});
 
       unpackBlockLoadResult(ret, loadedVals, elemIdx, regMapping,
                             shuffleMapping, {}, unpackedType, numValuesPerLoad,
@@ -5760,7 +5847,7 @@ struct Subgroup2DBlockLoadFromPtrOpConversion
     } else {
       sizeInfo =
           get2DBlockLoadTileSize(*llEncoding, contiguousDim, elemSizeInBits,
-                                   nullptr, maskAxisInfo, oneMatrixPerLoadForBT);
+                                 nullptr, maskAxisInfo, oneMatrixPerLoadForBT);
     }
     if (!sizeInfo.isValid())
       return failure();
