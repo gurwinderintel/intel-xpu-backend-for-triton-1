@@ -590,9 +590,10 @@ struct LoadStoreConversionBase {
   //   EVICT_LAST  -> L1C_L3C    (cache at all levels: keep the line warm for
   //                              anticipated reuse)
   //   NORMAL      -> DEFAULT    (let the hardware decide)
-  template <typename OpType, typename = std::enable_if_t<llvm::is_one_of<
-                                 OpType, LoadOp, DescriptorLoadOp,
-                                 triton::gpu::intel::DescriptorGatherPrefetchOp>::value>>
+  template <typename OpType,
+            typename = std::enable_if_t<llvm::is_one_of<
+                OpType, LoadOp, DescriptorLoadOp,
+                triton::gpu::intel::DescriptorGatherPrefetchOp>::value>>
   TritonGEN::LoadCacheControl tritonToIntelCacheModifier(OpType &op) const {
     CacheModifier cacheModifier = op.getCache();
 
@@ -3551,32 +3552,8 @@ struct DescriptorGatherOpConversion
             .toLinearLayout(resultType.getShape());
     assert(llEncoding.has_value() &&
            "unexpected failure when getting linear layout");
-    // llvm::outs() << "johnlu llEncoding: " << llEncoding << "\n";
-
-    auto outDimSize = offsetsXLLEncoding->getOutDimSizeLog2(str_attr("dim0"));
-    auto inDimSize = offsetsXLLEncoding->getInDimSize(str_attr("register"));
-    std::vector<std::vector<int>> offsetBases(outDimSize, {0});
-    const LinearLayout::BasesT &_bases = offsetsXLLEncoding->getBases();
-    for (const auto &base : _bases) {
-      StringAttr attr = base.first;
-      if (attr.getValue().compare(str_attr("register")) == 0) {
-        auto regBases = base.second;
-        for (size_t i = 0; i < regBases.size(); ++i) {
-          if (regBases[i][0]) {
-            offsetBases[llvm::Log2_32(regBases[i][0])] = {1 << i};
-          }
-        }
-        break;
-      }
-    }
-    LinearLayout offMapping({{str_attr("dim0"), offsetBases}},
-                            {{str_attr("dim0"), inDimSize}},
-                            /*requireSurjective=*/false);
-    offMapping *=
-        LinearLayout::zeros1D(llEncoding->getOutDimSize(str_attr("dim1")),
-                              str_attr("dim1"), str_attr("dim0"));
-    offMapping = llEncoding->compose(offMapping);
-    // llvm::outs() << "johnlu offMapping: " << offMapping << "\n";
+    llvm::outs() << "johnlu llEncoding: " << llEncoding << "\n";
+    llvm::outs() << "johnlu offsetsXLLEncoding: " << offsetsXLLEncoding << "\n";
 
     size_t resultRank = resultType.getRank();
     Type valueElemTy = typeConverter->convertType(resultType.getElementType());
@@ -3615,8 +3592,6 @@ struct DescriptorGatherOpConversion
            "1D block I/O should not require useVNNIFormat");
     assert(rowDim == 0 && "only support rowDim=0 for 1D block I/O");
     assert(colDim == 1 && "only support colDim=1 for 1D block I/O");
-    unsigned threadsPerWarp =
-        TritonGPUDialect::getThreadsPerWarp(op->getParentOfType<ModuleOp>());
     // assert(tileWidth == threadsPerWarp &&
     //        "1D block I/O should have tileWidth equal to threads per warp");
     std::optional<SetVector<unsigned>> regPackedBases =
@@ -3625,12 +3600,67 @@ struct DescriptorGatherOpConversion
     unsigned bytesPerLane = 16;
     unsigned bytesPerRow = numPackedVals * tileWidth * elemSizeInBits / 8;
     unsigned lanesPerRow = ceil(bytesPerRow, bytesPerLane);
+    unsigned threadsPerWarp =
+        TritonGPUDialect::getThreadsPerWarp(op->getParentOfType<ModuleOp>());
     assert(lanesPerRow * tileHeight == threadsPerWarp &&
            "wrong in vector gather");
-    unsigned numValuesPerLoad = tileHeight * tileWidth / threadsPerWarp;
-    unsigned numElemsPerLoad = numValuesPerLoad * numPackedVals;
-    DescriptorFields desc = unpackDescriptor(llDesc, descRank, loc, rewriter);
+    // unsigned numValuesPerLoad = tileHeight * tileWidth / threadsPerWarp;
+    unsigned numValuesPerLoad = bytesPerLane / 4;
+    unsigned numElemsPerLoad =
+        (tileHeight * tileWidth / threadsPerWarp) * numPackedVals;
 
+    auto getBase = [&](const LinearLayout &ll, const std::string &inDim) {
+      const LinearLayout::BasesT &bases = ll.getBases();
+      for (const auto &base : bases) {
+        StringAttr attr = base.first;
+        if (attr.getValue().compare(inDim) == 0)
+          return base.second;
+      }
+      llvm_unreachable(("Could not find the input dim:" + inDim +
+                        ", on the ll:" + ll.toString())
+                           .c_str());
+    };
+    auto outDimSize = offsetsXLLEncoding->getOutDimSizeLog2(str_attr("dim0"));
+    auto inDimSize = offsetsXLLEncoding->getInDimSize(str_attr("register"));
+    std::vector<std::vector<int>> offsetBases(outDimSize, {0});
+    const LinearLayout::BasesT &_bases = offsetsXLLEncoding->getBases();
+    for (const auto &base : _bases) {
+      StringAttr attr = base.first;
+      if (attr.getValue().compare(str_attr("register")) == 0) {
+        auto regBases = base.second;
+        for (size_t i = 0; i < regBases.size(); ++i) {
+          if (regBases[i][0]) {
+            offsetBases[llvm::Log2_32(regBases[i][0])] = {1 << i};
+          } else {
+            offsetBases[llvm::Log2_32(regBases[i][0])] = {1 << i};
+          }
+        }
+        break;
+      }
+    }
+    std::vector<std::vector<int>> laneBases;
+    for (size_t i = 0; i < llvm::Log2_32(threadsPerWarp); ++i) {
+      if (i < llvm::Log2_32(lanesPerRow)) {
+        llvm::outs() << "bases {0, "
+                     << ((bytesPerLane / (elemSizeInBits / 8)) << i) << "}\n";
+        laneBases.push_back(
+            {0, (int)(bytesPerLane / (elemSizeInBits / 8)) << i});
+      } else {
+        llvm::outs() << "bases {" << (1 << (i - llvm::Log2_32(lanesPerRow)))
+                     << ", 0}\n";
+        laneBases.push_back({1 << (i - llvm::Log2_32(lanesPerRow)), 0});
+      }
+    }
+
+    LinearLayout offMapping(
+        {{str_attr("register"), getBase(*llEncoding, "register")},
+         {str_attr("lane"), laneBases}},
+        {{str_attr("offx_idx"), inDimSize},
+         {str_attr("dim1"), llEncoding->getOutDimSize(str_attr("dim1"))}},
+        /*requireSurjective=*/false);
+    llvm::outs() << "johnlu offMapping: " << offMapping << "\n";
+
+    DescriptorFields desc = unpackDescriptor(llDesc, descRank, loc, rewriter);
     StringAttr kRegister = S("register");
     StringAttr kLane = S("lane");
     StringAttr kWarp = S("warp");
@@ -3650,9 +3680,16 @@ struct DescriptorGatherOpConversion
     // llvm::outs() << "shuffleMapping: " << shuffleMapping << "\n";
     // Get padding from the propagated attribute (set by
     // MaterializeBlockPointer).
-    Type packedType = IntegerType::get(ctx, elemSizeInBits * numPackedVals);
+    Type dpasType = IntegerType::get(ctx, bytesPerLane * 8);
+    Type packedType = IntegerType::get(ctx, (bytesPerLane / 4) * 8);
     Type load1DGenXType = LLVM::getVectorType(packedType, numValuesPerLoad);
     Type unpackedType = LLVM::getVectorType(valueElemTy, numElemsPerLoad);
+    llvm::outs() << "dpasType: " << dpasType << "\n";
+    llvm::outs() << "packedType: " << packedType << "\n";
+    llvm::outs() << "load1DGenXType: " << load1DGenXType << "\n";
+    llvm::outs() << "unpackedType: " << unpackedType << "\n";
+    uint32_t alignment = bytesPerLane;
+    // llvm::outs() << "alignment: " << alignment << "\n";
 
     PaddingOption padding = PaddingOption::PAD_ZERO;
     if (auto paddingAttr = op->getAttrOfType<triton::PaddingOptionAttr>(
@@ -3668,6 +3705,19 @@ struct DescriptorGatherOpConversion
         rewriter, loc, op->getParentOfType<ModuleOp>(), ProgramIDDim::X);
 
     auto [laneId, warpId] = getLaneAndWarpId(rewriter, loc);
+
+    VectorType offsetXVecType = vec_ty(offsetsX[0].getType(), offsetsX.size());
+    Value offsetXVec = b.undef(offsetXVecType);
+    for (size_t i = 0; i < offsetsX.size(); i++) {
+      Value indexVal =
+          LLVM::createIndexConstant(rewriter, loc, typeConverter, i);
+      offsetXVec = b.insert_element(offsetXVec, offsetsX[i], indexVal);
+    }
+
+    Intrinsic reinterpretCast =
+        GenISA<llvm::GenISAIntrinsic::ID::GenISA_SubgroupBitcastShuffle>(
+            rewriter, unpackedType, dpasType);
+
     for (size_t elemIdx = 0; elemIdx < numElems; elemIdx += numElemsPerLoad) {
       unsigned registerIdx = regMapping.apply({{kRegister, elemIdx}})[0].second;
 
@@ -3754,13 +3804,15 @@ struct DescriptorGatherOpConversion
         loadGather(args, /*onlyAttachMLIRArgs=*/true);
         ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
       }
-#else
+#elif 0
       SmallVector<Value> addrs;
       for (size_t i = 0; i < tileHeight; ++i) {
         Value indexVal =
             LLVM::createIndexConstant(rewriter, loc, typeConverter, i);
-        unsigned offsetIdx =
-            regMapping.apply({{kRegister, elemIdx + i}})[0].second;
+        unsigned offsetIdx = regMapping.apply(
+                                           {{ kRegister,
+                                              elemIdx + i }})[0]
+                                 .second;
         auto offsets = offMapping.apply(
             {{kRegister, offsetIdx}, {kLane, 0}, {kWarp, 0}, {kBlock, 0}});
 
@@ -3811,11 +3863,66 @@ struct DescriptorGatherOpConversion
 
       loadGather(args, /*onlyAttachMLIRArgs=*/true);
       Value ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
+#else
+
+      Value offsetXIdx, offsetX, offsetY;
+      {
+        auto offsets = applyLinearLayout(
+            loc, rewriter, offMapping,
+            {{kRegister, b.i32_val(registerIdx)}, {kLane, laneId}});
+        for (auto [dim, offsetPair] : llvm::enumerate(offsets)) {
+          if (dim == colDim) {
+            offsetY = offsetPair.second;
+            addrElem = b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offsetY);
+            continue;
+          } else if (dim == rowDim) { // Update offset X
+            offsetXIdx = offsetPair.second;
+            offsetX = b.zext(int_ty(64),
+                             b.extract_element(offsetXVec, offsetPair.second));
+            Value offset64 = b.mul(offsetX, desc.strides[rowDim]);
+            addrElem = b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offset64);
+            continue;
+          }
+          llvm_unreachable("unexpected dim in offset mapping");
+        }
+      }
+      // Value ret = b.undef(load1DGenXType);
+      Value ret = b.load(load1DGenXType, addrElem, alignment,
+                         /*isVolatile=*/false, /*isNonTemporal=*/false);
+      // ret = b.bitcast(ret, dpasType);
+
+      // /// Inlined ASM
+      // {
+      //   .decl DPAS_TRANS v_type=G type=ud num_elts=32 align=wordx32
+      //   alias=<V0318, 0>
+      // }
+      // /// End Inlined ASM
+      //       constexpr StringLiteral gatherLoad = R"({
+      //   .decl DPAS_TRANS v_type=G type=ud num_elts=64 align=wordx32
+      //   alias=<$1, 0> .decl DPAS v_type=G type=ud num_elts=64 align=wordx32
+      //   alias=<$0, 0>
+      //    mov (M1_NM, 16) DPAS(0,0)<4>  DPAS_TRANS(0,0)<1;1,0>
+      //    mov (M1_NM, 16) DPAS(0,1)<4>  DPAS_TRANS(1,0)<1;1,0>
+      //    mov (M1_NM, 16) DPAS(0,2)<4>  DPAS_TRANS(2,0)<1;1,0>
+      //    mov (M1_NM, 16) DPAS(0,3)<4>  DPAS_TRANS(3,0)<1;1,0>
+      // })";
+
+      // XeBuilder xeBuilder;
+      // XeInstr &loadGather = *xeBuilder.create<XeInstr>(gatherLoad.str());
+      // XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
+      // XeBuilder::Operand *re = xeBuilder.newOperand(ret, "rw");
+      // SmallVector<XeBuilder::Operand *> args{res, re};
+      // loadGather(args, /*onlyAttachMLIRArgs=*/true);
+      // ret = xeBuilder.launch(rewriter, loc, dpasType, false);
+      ret = b.bitcast(ret, unpackedType);
+      // ret = reinterpretCast(rewriter, loc, ret);
+
 #endif
       targetInfo.printf(
           rewriter,
-          "johnlu load: pid: %d, warp id: %d, lane id: %d addr %p ret %f",
-          {pid, warpId, laneId, addrElem, b.bitcast(ret, unpackedType)});
+          "johnlu load: pid: %d, warp id: %d, lane id: %d addr %p offsetXIdx "
+          "%d offsetX %d offsetY %d ret %f",
+          {pid, warpId, laneId, addrElem, offsetXIdx, offsetX, offsetY, ret});
       unpackBlockLoadResult(ret, loadedVals, elemIdx, regMapping,
                             shuffleMapping, {}, unpackedType, numValuesPerLoad,
                             numPackedVals, {}, {},
