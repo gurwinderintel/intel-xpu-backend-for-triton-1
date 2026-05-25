@@ -3552,8 +3552,9 @@ struct DescriptorGatherOpConversion
             .toLinearLayout(resultType.getShape());
     assert(llEncoding.has_value() &&
            "unexpected failure when getting linear layout");
-    llvm::outs() << "johnlu llEncoding: " << llEncoding << "\n";
-    llvm::outs() << "johnlu offsetsXLLEncoding: " << offsetsXLLEncoding << "\n";
+    // llvm::outs() << "johnlu llEncoding: " << llEncoding << "\n";
+    // llvm::outs() << "johnlu offsetsXLLEncoding: " << offsetsXLLEncoding <<
+    // "\n";
 
     size_t resultRank = resultType.getRank();
     Type valueElemTy = typeConverter->convertType(resultType.getElementType());
@@ -3641,13 +3642,14 @@ struct DescriptorGatherOpConversion
     std::vector<std::vector<int>> laneBases;
     for (size_t i = 0; i < llvm::Log2_32(threadsPerWarp); ++i) {
       if (i < llvm::Log2_32(lanesPerRow)) {
-        llvm::outs() << "bases {0, "
-                     << ((bytesPerLane / (elemSizeInBits / 8)) << i) << "}\n";
+        // llvm::outs() << "bases {0, "
+        //              << ((bytesPerLane / (elemSizeInBits / 8)) << i) <<
+        //              "}\n";
         laneBases.push_back(
             {0, (int)(bytesPerLane / (elemSizeInBits / 8)) << i});
       } else {
-        llvm::outs() << "bases {" << (1 << (i - llvm::Log2_32(lanesPerRow)))
-                     << ", 0}\n";
+        // llvm::outs() << "bases {" << (1 << (i - llvm::Log2_32(lanesPerRow)))
+        //              << ", 0}\n";
         laneBases.push_back({1 << (i - llvm::Log2_32(lanesPerRow)), 0});
       }
     }
@@ -3658,7 +3660,7 @@ struct DescriptorGatherOpConversion
         {{str_attr("offx_idx"), inDimSize},
          {str_attr("dim1"), llEncoding->getOutDimSize(str_attr("dim1"))}},
         /*requireSurjective=*/false);
-    llvm::outs() << "johnlu offMapping: " << offMapping << "\n";
+    // llvm::outs() << "johnlu offMapping: " << offMapping << "\n";
 
     DescriptorFields desc = unpackDescriptor(llDesc, descRank, loc, rewriter);
     StringAttr kRegister = S("register");
@@ -3684,10 +3686,10 @@ struct DescriptorGatherOpConversion
     Type packedType = IntegerType::get(ctx, (bytesPerLane / 4) * 8);
     Type load1DGenXType = LLVM::getVectorType(packedType, numValuesPerLoad);
     Type unpackedType = LLVM::getVectorType(valueElemTy, numElemsPerLoad);
-    llvm::outs() << "dpasType: " << dpasType << "\n";
-    llvm::outs() << "packedType: " << packedType << "\n";
-    llvm::outs() << "load1DGenXType: " << load1DGenXType << "\n";
-    llvm::outs() << "unpackedType: " << unpackedType << "\n";
+    // llvm::outs() << "dpasType: " << dpasType << "\n";
+    // llvm::outs() << "packedType: " << packedType << "\n";
+    // llvm::outs() << "load1DGenXType: " << load1DGenXType << "\n";
+    // llvm::outs() << "unpackedType: " << unpackedType << "\n";
     uint32_t alignment = bytesPerLane;
     // llvm::outs() << "alignment: " << alignment << "\n";
 
@@ -3724,6 +3726,7 @@ struct DescriptorGatherOpConversion
       Value addrElem = desc.base;
       // update offset Y.
       addrElem = b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offsetY);
+#if 0
       auto offsets = applyLinearLayout(loc, rewriter, *llEncoding,
                                        {{kRegister, b.i32_val(registerIdx)},
                                         {kLane, b.i32_val(0)},
@@ -3735,6 +3738,7 @@ struct DescriptorGatherOpConversion
               b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offsetPair.second);
         }
       }
+#endif
 #if 0
       // Make a nonuniform pointer of vector.
       {
@@ -3865,15 +3869,16 @@ struct DescriptorGatherOpConversion
       Value ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
 #else
 
-      Value offsetXIdx, offsetX, offsetY;
+      Value offsetXIdx, offsetX, linearOffsetY;
       {
         auto offsets = applyLinearLayout(
             loc, rewriter, offMapping,
             {{kRegister, b.i32_val(registerIdx)}, {kLane, laneId}});
         for (auto [dim, offsetPair] : llvm::enumerate(offsets)) {
           if (dim == colDim) {
-            offsetY = offsetPair.second;
-            addrElem = b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offsetY);
+            linearOffsetY = offsetPair.second;
+            addrElem =
+                b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, linearOffsetY);
             continue;
           } else if (dim == rowDim) { // Update offset X
             offsetXIdx = offsetPair.second;
@@ -3896,33 +3901,75 @@ struct DescriptorGatherOpConversion
       //   .decl DPAS_TRANS v_type=G type=ud num_elts=32 align=wordx32
       //   alias=<V0318, 0>
       // }
-      // /// End Inlined ASM
-      //       constexpr StringLiteral gatherLoad = R"({
-      //   .decl DPAS_TRANS v_type=G type=ud num_elts=64 align=wordx32
-      //   alias=<$1, 0> .decl DPAS v_type=G type=ud num_elts=64 align=wordx32
-      //   alias=<$0, 0>
-      //    mov (M1_NM, 16) DPAS(0,0)<4>  DPAS_TRANS(0,0)<1;1,0>
-      //    mov (M1_NM, 16) DPAS(0,1)<4>  DPAS_TRANS(1,0)<1;1,0>
-      //    mov (M1_NM, 16) DPAS(0,2)<4>  DPAS_TRANS(2,0)<1;1,0>
-      //    mov (M1_NM, 16) DPAS(0,3)<4>  DPAS_TRANS(3,0)<1;1,0>
-      // })";
+      /// End Inlined ASM
+      constexpr StringLiteral transposeVal = R"({
+        .decl DPAS_TRANS v_type=G type=ud num_elts=64 align=wordx32 alias=<$1, 0>
+        .decl DPAS v_type=G type=ud num_elts=64 align=wordx32 alias=<$0, 0>
+         mov (M1_NM, 16) DPAS(0,0)<4>  DPAS_TRANS(0,0)<1;1,0>
+         mov (M1_NM, 16) DPAS(0,1)<4>  DPAS_TRANS(1,0)<1;1,0>
+         mov (M1_NM, 16) DPAS(0,2)<4>  DPAS_TRANS(2,0)<1;1,0>
+         mov (M1_NM, 16) DPAS(0,3)<4>  DPAS_TRANS(3,0)<1;1,0>
+      })";
 
-      // XeBuilder xeBuilder;
-      // XeInstr &loadGather = *xeBuilder.create<XeInstr>(gatherLoad.str());
-      // XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
-      // XeBuilder::Operand *re = xeBuilder.newOperand(ret, "rw");
-      // SmallVector<XeBuilder::Operand *> args{res, re};
-      // loadGather(args, /*onlyAttachMLIRArgs=*/true);
-      // ret = xeBuilder.launch(rewriter, loc, dpasType, false);
-      ret = b.bitcast(ret, unpackedType);
+      XeBuilder xeBuilder;
+      XeInstr &transOp = *xeBuilder.create<XeInstr>(transposeVal.str());
+      XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
+      XeBuilder::Operand *re = xeBuilder.newOperand(ret, "rw");
+      SmallVector<XeBuilder::Operand *> args{res, re};
+      transOp(args, /*onlyAttachMLIRArgs=*/true);
+      ret = xeBuilder.launch(rewriter, loc, unpackedType, false);
+      // ret = b.bitcast(ret, unpackedType);
       // ret = reinterpretCast(rewriter, loc, ret);
 
 #endif
+#if 0
+      TritonLLVMIRRewriter tb(loc, rewriter);
+      Value r0 = b.bitcast(b.extract_element(ret, b.i32_val(0)), i16_ty);
+      Value r1 = b.bitcast(b.extract_element(ret, b.i32_val(1)), i16_ty);
+      Value r2 = b.bitcast(b.extract_element(ret, b.i32_val(2)), i16_ty);
+      Value r3 = b.bitcast(b.extract_element(ret, b.i32_val(3)), i16_ty);
+      Value r4 = b.bitcast(b.extract_element(ret, b.i32_val(4)), i16_ty);
+      Value r5 = b.bitcast(b.extract_element(ret, b.i32_val(5)), i16_ty);
+      Value r6 = b.bitcast(b.extract_element(ret, b.i32_val(6)), i16_ty);
+      Value r7 = b.bitcast(b.extract_element(ret, b.i32_val(7)), i16_ty);
+      r0 = triton::intel::convertWithFunctionCall(
+          tb, r0, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r1 = triton::intel::convertWithFunctionCall(
+          tb, r1, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r2 = triton::intel::convertWithFunctionCall(
+          tb, r2, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r3 = triton::intel::convertWithFunctionCall(
+          tb, r3, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r4 = triton::intel::convertWithFunctionCall(
+          tb, r4, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r5 = triton::intel::convertWithFunctionCall(
+          tb, r5, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r6 = triton::intel::convertWithFunctionCall(
+          tb, r6, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
+
+      r7 = triton::intel::convertWithFunctionCall(
+          tb, r7, "__spirv_ConvertBF16ToFINTEL", i16_ty, f32_ty,
+          TritonIntelGPUDialect::getSupportBFloat16ConversionAttrName());
       targetInfo.printf(
           rewriter,
           "johnlu load: pid: %d, warp id: %d, lane id: %d addr %p offsetXIdx "
-          "%d offsetX %d offsetY %d ret %f",
-          {pid, warpId, laneId, addrElem, offsetXIdx, offsetX, offsetY, ret});
+          "%d offsetX %d offsetY %d ret %f, %f, %f, %f, %f, %f, %f, %f",
+          {pid, warpId, laneId, addrElem, offsetXIdx, offsetX, offsetY, r0, r1,
+           r2, r3, r4, r5, r6, r7});
+#endif
       unpackBlockLoadResult(ret, loadedVals, elemIdx, regMapping,
                             shuffleMapping, {}, unpackedType, numValuesPerLoad,
                             numPackedVals, {}, {},
