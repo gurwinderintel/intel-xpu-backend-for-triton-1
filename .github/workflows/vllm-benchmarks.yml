@@ -123,8 +123,7 @@ jobs:
         id: install-vllm
         if: ${{ steps.install-benchmarks.outcome == 'success' && !cancelled() }}
         run: |
-          source ./scripts/capture-hw-details.sh
-          ./scripts/test-triton.sh --install-vllm --skip-pip-install --skip-pytorch-install
+          ./scripts/vllm/install-vllm.sh --source
 
       - name: Run vllm unified attention bf16
         if: ${{ steps.install-vllm.outcome == 'success' && !cancelled() }}
