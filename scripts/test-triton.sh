@@ -890,7 +890,7 @@ run_vllm_install() {
   echo "************************************************"
   echo "vllm pin: $(<"$TRITON_PROJ/scripts/vllm/vllm-pin.txt")"
 
-  "$SCRIPTS_DIR/vllm/install-vllm.sh" $([ "$VENV" = true ] && echo "--venv")
+  "$SCRIPTS_DIR/vllm/install-vllm.sh" $([ "$VENV" = true ] && echo "--venv") --triton-repo-branch quinnlp/xpu-kernels
 }
 
 
