@@ -66,6 +66,8 @@ def fused_gemm_swiglu_kernel(
     group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
     pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
     pid_n = (pid % num_pid_in_group) // group_size_m
+    if (pid_m * BLOCK_SIZE_M >= M) or (pid_n * BLOCK_SIZE_N >= N):
+        return
 
     off_m = pid_m * BLOCK_SIZE_M
     off_n = pid_n * BLOCK_SIZE_N
