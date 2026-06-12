@@ -3553,8 +3553,30 @@ struct DescriptorGatherOpConversion
     assert(llEncoding.has_value() &&
            "unexpected failure when getting linear layout");
     // llvm::outs() << "johnlu llEncoding: " << llEncoding << "\n";
+    auto subLayout = llEncoding->sublayout(
+        llvm::to_vector(llEncoding->getInDimNames()), {str_attr("dim0")});
+    // llvm::outs() << "johnlu subLayout: " << subLayout << "\n";
     // llvm::outs() << "johnlu offsetsXLLEncoding: " << offsetsXLLEncoding <<
     // "\n";
+    auto regMLayout = subLayout.invertAndCompose(*offsetsXLLEncoding);
+    // llvm::outs() << "johnlu subLayout.invertCompse: " << regMLayout << "\n";
+
+    StringAttr kRegister = S("register");
+    StringAttr kLane = S("lane");
+    StringAttr kWarp = S("warp");
+    StringAttr kBlock = S("block");
+
+    std::optional<LinearLayout> conversion = regMLayout.quotient(kBlock);
+    assert(conversion && "invalid quotient by block");
+    conversion = conversion->quotient(kWarp);
+    assert(conversion && "invalid quotient by warp");
+    conversion = conversion->quotient(kLane);
+    assert(conversion && "invalid quotient by lane");
+    // llvm::outs() << "johnlu conversion: " << *conversion << "\n";
+    auto offsetYLayout = llEncoding->sublayout(kRegister, {str_attr("dim1")});
+    // llvm::outs() << "johnlu offsetYLayout: " << offsetYLayout << "\n";
+    //  *conversion *= offsetYLayout;
+    //  llvm::outs() << "johnlu conversion: " << *conversion << "\n";
 
     size_t resultRank = resultType.getRank();
     Type valueElemTy = typeConverter->convertType(resultType.getElementType());
@@ -3623,8 +3645,8 @@ struct DescriptorGatherOpConversion
                         ", on the ll:" + ll.toString())
                            .c_str());
     };
+#if 0
     auto outDimSize = offsetsXLLEncoding->getOutDimSizeLog2(str_attr("dim0"));
-    auto inDimSize = offsetsXLLEncoding->getInDimSize(str_attr("register"));
     std::vector<std::vector<int>> offsetBases(outDimSize, {0});
     const LinearLayout::BasesT &_bases = offsetsXLLEncoding->getBases();
     for (const auto &base : _bases) {
@@ -3633,14 +3655,21 @@ struct DescriptorGatherOpConversion
         auto regBases = base.second;
         for (size_t i = 0; i < regBases.size(); ++i) {
           if (regBases[i][0]) {
+            // llvm::outs() << "offsetBases[" << llvm::Log2_32(regBases[i][0]) << "] {"
+            //              << (1 << i) <<
+            //              "}\n";
             offsetBases[llvm::Log2_32(regBases[i][0])] = {1 << i};
           } else {
-            offsetBases[llvm::Log2_32(regBases[i][0])] = {1 << i};
+            // llvm::outs() << "offsetBases[" << llvm::Log2_32(regBases[i][0]) << "] {"
+            //              << 0 <<
+            //              "}\n";
+            offsetBases[llvm::Log2_32(regBases[i][0])] = {0};
           }
         }
         break;
       }
     }
+#endif
     std::vector<std::vector<int>> laneBases;
     for (size_t i = 0; i < llvm::Log2_32(threadsPerWarp); ++i) {
       if (i < llvm::Log2_32(lanesPerRow)) {
@@ -3656,19 +3685,23 @@ struct DescriptorGatherOpConversion
       }
     }
 
+    // llvm::outs() << "offx_idx inDimSize:" << inDimSize << "\n";
+    auto offsetXIndexBases = getBase(*conversion, "register");
+    auto offsetYBases = getBase(offsetYLayout, "register");
+    std::vector<std::vector<int>> offsetMapBases;
+    for (auto const &[oXI, oY] : llvm::zip(offsetXIndexBases, offsetYBases)) {
+      offsetMapBases.push_back({oXI[0], oY[0]});
+      // llvm::outs() << "offsetMapBases {" << oXI[0] << ", " << oY[0] << "}\n";
+    }
+    auto inDimSize = offsetsXLLEncoding->getInDimSize(str_attr("register"));
     LinearLayout offMapping(
-        {{str_attr("register"), getBase(*llEncoding, "register")},
-         {str_attr("lane"), laneBases}},
+        {{str_attr("register"), offsetMapBases}, {str_attr("lane"), laneBases}},
         {{str_attr("offx_idx"), inDimSize},
          {str_attr("dim1"), llEncoding->getOutDimSize(str_attr("dim1"))}},
         /*requireSurjective=*/false);
     // llvm::outs() << "johnlu offMapping: " << offMapping << "\n";
 
     DescriptorFields desc = unpackDescriptor(llDesc, descRank, loc, rewriter);
-    StringAttr kRegister = S("register");
-    StringAttr kLane = S("lane");
-    StringAttr kWarp = S("warp");
-    StringAttr kBlock = S("block");
     assert(regPackedBases.has_value() &&
            "invalid register bases for packing elems.");
     std::vector<std::vector<int>> bases(regPackedBases->size());
@@ -3811,7 +3844,7 @@ struct DescriptorGatherOpConversion
         ret = xeBuilder.launch(rewriter, loc, load1DGenXType, false);
       }
 #elif 1
-      SmallVector<Value> addrs;
+      SmallVector<Value> addrs, predicts;
       auto linearOffsetY =
           offMapping.apply({{kRegister, registerIdx}, {kLane, 0}})[1];
       assert(linearOffsetY.first == str_attr("dim1"));
@@ -3831,14 +3864,31 @@ struct DescriptorGatherOpConversion
             rewriter, loc, offsetsX[offsetXIdx.second], 0);
         uniformOffsetsX.push_back(offsetUniform);
         Value offsetX = b.zext(int_ty(64), offsetUniform);
+        Value pred = b.icmp_ult(offsetX, desc.shapes[0]);
         Value offset64 = b.mul(offsetX, desc.strides[rowDim]);
+
+        Value offsetY0 = b.i32_val(0 * elemNum);
+        Value offsetY1 = b.i32_val(1 * elemNum);
+        Value offsetY2 = b.i32_val(2 * elemNum);
+        Value offsetY3 = b.i32_val(3 * elemNum);
+        predicts.push_back(b.and_(
+            pred, b.icmp_ult(b.zext(int_ty(64), b.add(offsetY0, offsetY)),
+                             desc.shapes[1])));
+        predicts.push_back(b.and_(
+            pred, b.icmp_ult(b.zext(int_ty(64), b.add(offsetY1, offsetY)),
+                             desc.shapes[1])));
+        predicts.push_back(b.and_(
+            pred, b.icmp_ult(b.zext(int_ty(64), b.add(offsetY2, offsetY)),
+                             desc.shapes[1])));
+        predicts.push_back(b.and_(
+            pred, b.icmp_ult(b.zext(int_ty(64), b.add(offsetY3, offsetY)),
+                             desc.shapes[1])));
+
         Value addr0 = b.gep(ptr_ty(ctx, 1), valueElemTy, addrElem, offset64);
-        Value addr1 =
-            b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, b.i32_val(1 * elemNum));
-        Value addr2 =
-            b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, b.i32_val(2 * elemNum));
-        Value addr3 =
-            b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, b.i32_val(3 * elemNum));
+        Value addr1 = b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, offsetY1);
+        Value addr2 = b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, offsetY2);
+        Value addr3 = b.gep(ptr_ty(ctx, 1), valueElemTy, addr0, offsetY3);
+
         // Update offset Y
         addrs.push_back(b.ptrtoint(i64_ty, addr0));
         addrs.push_back(b.ptrtoint(i64_ty, addr1));
@@ -3846,16 +3896,20 @@ struct DescriptorGatherOpConversion
         addrs.push_back(b.ptrtoint(i64_ty, addr3));
       }
       Value ptrVec = b.undef(vec_ty(i64_ty, addrs.size()));
+      Value predVec = b.undef(vec_ty(i1_ty, addrs.size()));
       for (size_t i = 0; i < addrs.size(); ++i) {
         Value sVal = createIndexAttrConstant(rewriter, loc,
                                              typeConverter->getIndexType(), i);
         ptrVec = b.insert_element(ptrVec, addrs[i], sVal);
+        predVec = b.insert_element(predVec, predicts[i], sVal);
       }
 
       constexpr StringLiteral abDecl = R"({
   .decl RET v_type=G type=uq num_elts=32 align=wordx32 alias=<$0, 0>
   .decl ADDR v_type=G type=uq num_elts=32 align=wordx32 alias=<$1, 0>
-  lsc_load.ugm (M1_NM, 32)  RET:d64  flat[ADDR]:a64
+  .decl PRED v_type=P num_elts=32
+  cmp.eq (M1_NM, 32) PRED 0x1:b $2(0, 0)<1;1,0>
+  (PRED) lsc_load.ugm (M1, 32)  RET:d64  flat[ADDR]:a64
 })";
 
       std::string simdAsm = abDecl.str();
@@ -3864,7 +3918,8 @@ struct DescriptorGatherOpConversion
       XeInstr &loadGather = *xeBuilder.create<XeInstr>(simdAsm);
       XeBuilder::Operand *res = xeBuilder.newOperand("=rw");
       XeBuilder::Operand *ptrs = xeBuilder.newOperand(ptrVec, "rw.u");
-      SmallVector<XeBuilder::Operand *> args{res, ptrs};
+      XeBuilder::Operand *preds = xeBuilder.newOperand(predVec, "rw.u");
+      SmallVector<XeBuilder::Operand *> args{res, ptrs, preds};
       loadGather(args, /*onlyAttachMLIRArgs=*/true);
       Value ret = xeBuilder.launch(rewriter, loc, unpackedType, false);
 
