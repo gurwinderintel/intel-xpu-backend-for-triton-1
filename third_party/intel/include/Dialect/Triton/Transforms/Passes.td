@@ -70,42 +70,36 @@ def TritonIntelFuseReshape
 
 def TritonIntelStrideVersioning
     : Pass<"triton-intel-stride-versioning", "mlir::ModuleOp"> {
-  let summary = "Version loops containing tensor descriptor loads if none of the strides is 1";
+  let summary = "Version tensor-descriptor loops so the 2D-block fast path can fire";
 
   let description = [{
-    This pass versions loops that contain tt.descriptor_load on a tensor descriptor, if none of the descriptor strides is 1.
-    For example, given:
+    Versions tensor-descriptor loops on a runtime property that
+    `MaterializeBlockPointer` must prove at compile time to enable the 2D-block
+    fast path. Two cases:
 
-    %cst = arith.constant ...
-    %desc = tt.make_tensor_descriptor %base, [%s0, %s1], [%cst, %b]
-            : !tt.tensordesc<512x64xf16>
-    scf.for ... {
-      %load = tt.descriptor_load %desc[%x, %y]
-              : !tt.tensordesc<512x64xf16> -> tensor<512x64xf16>
-      ...
-    }
+    1. Stride (scf.for): the descriptor has no stride provably 1. Clone under
+       `if (stride == 1)` and set the then-branch descriptor stride to 1:
 
-    The transformation creates:
+       %desc  = tt.make_tensor_descriptor %base, [%s0, %s1], [%a, %b]
+       %desc' = tt.make_tensor_descriptor %base, [%s0, %s1], [%a, 1]
+       if (%b == 1) scf.for ... { tt.descriptor_load %desc'[...] }
+       else         scf.for ... { tt.descriptor_load %desc[...]  }
 
-    %desc = tt.make_tensor_descriptor %base, [%s0, %s1], [%a, %b]
-            : !tt.tensordesc<512x64xf16>
-    %desc' = tt.make_tensor_descriptor %base, [%s0, %s1], [%a, 1]
-             : !tt.tensordesc<512x64xf16>
-    if (%b == 1)
-      scf.for ... {
-        %load = tt.descriptor_load %desc'[%x, %y]
-                : !tt.tensordesc<512x64xf16> -> tensor<512x64xf16>
-        ...
-      }
-    else
-      scf.for ... {
-        %load = tt.descriptor_load %desc[%x, %y]
-                : !tt.tensordesc<512x64xf16> -> tensor<512x64xf16>
-        ...
-      }
+    2. Runtime row length (scf.while): the row length is a runtime
+       `gk = tl.load(...)`, so the gate cannot prove it divisible by the surface
+       granularity (2 for fp16). Clone the persistent loop under `if (gk % d == 0)`
+       and rewrite the then-branch row length to `(gk / d) * d` (== gk here, and
+       structurally divisible); the else-branch keeps `gk` for the gather path:
+
+       %a  = tt.make_tensor_descriptor %base, [%gm, %gk], [%lda, 1]
+       %a' = tt.make_tensor_descriptor %base, [%gm, (%gk / 2) * 2], [%lda, 1]
+       if (%gk % 2 == 0) scf.while ... { scf.for ... { ...%a'... } }
+       else              scf.while ... { scf.for ... { ...%a...  } }
   }];
 
   let dependentDialects = [
+    "mlir::arith::ArithDialect",
+    "mlir::scf::SCFDialect",
     "mlir::triton::TritonDialect"
   ];
 }
